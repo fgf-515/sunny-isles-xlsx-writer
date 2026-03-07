@@ -26,7 +26,7 @@ DEFAULT_OUTFIELDS = (
     "condo_flag,parent_folio"
 )
 
-# Condo tower plausibility threshold
+# Tower plausibility threshold
 MIN_TOWER_ROWS_FOR_COMPLETED = 50
 
 
@@ -72,7 +72,7 @@ def _arcgis_page(where: str, out_fields: str, offset: int, count: int) -> Dict[s
 
     for attempt in range(3):
         try:
-            r = requests.get(ARCGIS_QUERY_URL, params=params, timeout=60)
+            r = requests.get(ARCGIS_QUERY_URL, params=params, timeout=90)
         except requests.RequestException as e:
             last_error = f"ArcGIS request exception: {e}"
             time.sleep(1.5 * (attempt + 1))
@@ -95,7 +95,7 @@ def _arcgis_page(where: str, out_fields: str, offset: int, count: int) -> Dict[s
             details = " ".join(data["error"].get("details") or [])
             combined = (msg + " " + details).strip()
 
-            # Retry generic “Unable to perform query operation” a couple times
+            # Retry generic “Unable to perform query operation”
             if attempt < 2 and "Unable to perform query operation" in combined:
                 last_error = f"ArcGIS error (retryable): {data['error']}"
                 time.sleep(1.5 * (attempt + 1))
@@ -128,7 +128,6 @@ def _arcgis_fetch_all(where: str, out_fields: str) -> Tuple[List[Dict[str, Any]]
             break
         offset += page_size
 
-    # provenance URL for logging (note: not URL-encoded; ok for notes)
     source_url = f"{ARCGIS_QUERY_URL}?where={where}"
     return all_features, source_url
 
@@ -166,7 +165,6 @@ def _build_where_candidates(city: str, street_number: str, street_keyword: str) 
 def _arcgis_fetch_all_with_fallback(city: str, street_number: str, street_keyword: str) -> Tuple[List[Dict[str, Any]], str, str]:
     """
     Try multiple where clauses until one succeeds.
-    Fail-closed: if none succeed, raise HTTPException.
     """
     last_err: Optional[Exception] = None
 
@@ -192,6 +190,8 @@ def _get_header_map(ws) -> Dict[str, int]:
 
 
 def _cell(ws, row: int, col_name: str, header_map: Dict[str, int]):
+    if col_name not in header_map:
+        raise HTTPException(status_code=500, detail=f"Workbook missing required column: {col_name}")
     return ws.cell(row=row, column=header_map[col_name] + 1)
 
 
@@ -216,7 +216,7 @@ async def run_building(
     Server-side building run:
     - Fetch parcel unit records (LIKE-first with fallbacks)
     - Append Leads (dedupe on folio+unit)
-    - Update Target status (Completed only if records_added >= MIN_TOWER_ROWS_FOR_COMPLETED)
+    - Update Target status (Completed if retrieved_count >= threshold)
     - Append Run_Log
     - Return updated .xlsx
     """
@@ -227,8 +227,10 @@ async def run_building(
         city=city, street_number=street_number, street_keyword=street_keyword
     )
 
-    # Fail closed if nothing comes back (don’t produce a “no-op workbook”)
-    if not features:
+    retrieved_count = len(features)
+
+    # Fail closed if nothing comes back (don’t produce a no-op workbook)
+    if retrieved_count == 0:
         raise HTTPException(
             status_code=502,
             detail=f"No parcel features returned for target={target_name}. where={where_used}"
@@ -277,7 +279,6 @@ async def run_building(
         owner_raw = _join_owner(attr.get("true_owner1"), attr.get("true_owner2"), attr.get("true_owner3"))
         owner_type = _classify_owner_type(owner_raw)
 
-        # Build row keyed by your Leads header names
         row = {h: None for h in leads_map.keys()}
         row.update({
             "record_id": str(uuid.uuid4()),
@@ -315,15 +316,11 @@ async def run_building(
         existing.add(key)
         records_added += 1
 
-    # Fail closed if we retrieved features but wrote nothing (e.g., all duplicates)
-    # In that case, we still return workbook, but mark accordingly.
-    # (This is useful on reruns.)
-    # You can choose to raise instead, but this is typically fine.
+    # 5) Determine status based on retrieved_count (not records_added)
+    status_value = "Completed" if retrieved_count >= MIN_TOWER_ROWS_FOR_COMPLETED else "Needs Review"
 
-    # 5) Update Targets row
+    # 6) Update Targets row
     target_updated = False
-    status_value = "Completed" if records_added >= MIN_TOWER_ROWS_FOR_COMPLETED else "Needs Review"
-
     for r in range(2, ws_targets.max_row + 1):
         val = _cell(ws_targets, r, "value", targets_map).value
         ttype = _cell(ws_targets, r, "target_type", targets_map).value
@@ -337,7 +334,7 @@ async def run_building(
             target_updated = True
             break
 
-    # 6) Append Run_Log
+    # 7) Append Run_Log
     ws_log.append([
         str(uuid.uuid4()),      # run_id
         now_dt,                 # run_datetime
@@ -346,10 +343,10 @@ async def run_building(
         duplicates_skipped,
         "" if target_updated else "Target row not found / not updated",
         "Sunny Isles Owner Intel Agent",
-        f"status={status_value}; where={where_used}; features_retrieved={len(features)}",
+        f"status={status_value}; retrieved={retrieved_count}; where={where_used}",
     ])
 
-    # 7) Return updated workbook
+    # 8) Return updated workbook (FIXED HEADER LINE)
     out = BytesIO()
     wb.save(out)
     out.seek(0)
@@ -358,5 +355,5 @@ async def run_building(
     return StreamingResponse(
         out,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename=\"{filename}\""},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
